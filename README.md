@@ -181,6 +181,8 @@ Open the PDF from your running `skepsis --paper` review. Shift-click the PDF
 text and return to the browser to see the highlighted working-copy line in
 the diff, including unchanged lines. The same Okular setting works across
 projects and review restarts. This setup has been verified on Linux.
+With Poppler's `pdftotext` on PATH, forward jumps also highlight a uniquely
+matched line of PDF text using Okular's Find bar.
 
 ## How it works
 

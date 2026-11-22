@@ -14,8 +14,64 @@ import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
 
-async function sendLocation(url: string) {
-  const options = '0:0:0:1:0:::'
+// Use a rendered PDF line instead of guessing how TeX source appears on the page.
+export function uniqueTextAtSyncTeXLocation(layout: string, syncTeX: string) {
+  const page = Number(/^Page:(\d+)\s*$/m.exec(syncTeX)?.[1])
+  const x = Number(/^x:([^\r\n]+)/m.exec(syncTeX)?.[1])
+  const y = Number(/^y:([^\r\n]+)/m.exec(syncTeX)?.[1])
+  if (!(page > 0) || !Number.isFinite(x) || !Number.isFinite(y)) return
+
+  const lines: { atLocation: boolean; words: string[] }[] = []
+  let line: (typeof lines)[number] | undefined
+  for (const row of layout.split('\n')) {
+    const [level, rowPage, , , , , left, top, width, height, , word] = row.split('\t')
+    if (level === '4') {
+      // SyncTeX reports the baseline, which can sit slightly below the glyph box.
+      const atLocation =
+        Number(rowPage) === page &&
+        x >= Number(left) - 8 &&
+        x <= Number(left) + Number(width) + 8 &&
+        y >= Number(top) - 2 &&
+        y <= Number(top) + Number(height) + 2
+      line = { atLocation, words: [] }
+      lines.push(line)
+    } else if (level === '5' && word) {
+      line?.words.push(word.trim())
+    }
+  }
+  const matches = lines.filter((candidate) => candidate.atLocation)
+  if (matches.length !== 1) return
+  const phrase = matches[0]!.words.join(' ').replace(/\s+/g, ' ').trim()
+  if (phrase.length < 12 || phrase.length > 180) return
+
+  // Okular's search can move the viewport. Only use it for unique text.
+  const document = lines
+    .flatMap(({ words }) => words)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+  const query = phrase.toLowerCase()
+  const first = document.indexOf(query)
+  if (first >= 0 && first === document.lastIndexOf(query)) return phrase
+}
+
+async function okularHighlight(pdf: string, syncTeX: string | undefined) {
+  if (!syncTeX) return
+  try {
+    const { stdout } = await exec('pdftotext', ['-tsv', '-enc', 'UTF-8', pdf, '-'], {
+      timeout: 1500,
+      maxBuffer: 4 * 1024 * 1024,
+    })
+    return uniqueTextAtSyncTeXLocation(stdout, syncTeX)
+  } catch {
+    // A missing extractor or a PDF without searchable text still allows a jump.
+    return undefined
+  }
+}
+
+async function sendLocation(url: string, highlight?: string) {
+  const find = highlight ? Buffer.from(highlight).toString('base64') : ''
+  const options = `0:0:0:1:0::${find}:`
   const { stdout } = await exec(
     'dbus-send',
     [
@@ -36,7 +92,7 @@ async function sendLocation(url: string) {
 
 export function okularViewer(
   root: string,
-  openWindow: (url: string, cwd: string) => Promise<void>,
+  openWindow: (url: string, cwd: string, highlight?: string) => Promise<void>,
 ) {
   let review: { directory: string; main?: string } | undefined
   let queue = Promise.resolve()
@@ -47,6 +103,7 @@ export function okularViewer(
     pdf: string,
     source?: { file: string; line: number },
     rebuilt = false,
+    syncTeX?: string,
   ) {
     const url = pathToFileURL(pdf)
     if (source) url.hash = `src:${source.line} ${source.file}`
@@ -60,10 +117,12 @@ export function okularViewer(
       }
       if (review.main !== main || rebuilt)
         await rm(join(review.directory, 'selection'), { force: true })
+      const highlight = await okularHighlight(pdf, syncTeX)
+      if (closed) return
       try {
-        await sendLocation(url.href)
+        await sendLocation(url.href, highlight)
       } catch {
-        await openWindow(url.href, cwd)
+        await openWindow(url.href, cwd, highlight)
       }
       if (closed) return
       const registration = join(review.directory, 'review.json')

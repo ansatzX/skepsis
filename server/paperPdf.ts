@@ -244,8 +244,12 @@ export async function paperPdfRoutes(directory: string, mainTex?: string) {
     return running
   }
 
-  const desktop = okularViewer(root, (url, cwd) =>
-    openViewer('okular', ['--unique', url], cwd),
+  const desktop = okularViewer(root, (url, cwd, highlight) =>
+    openViewer(
+      'okular',
+      ['--unique', ...(highlight ? [`--find=${highlight}`] : []), url],
+      cwd,
+    ),
   )
   const app = new Hono()
   app.use('*', async (c, next) => {
@@ -303,6 +307,7 @@ export async function paperPdfRoutes(directory: string, mainTex?: string) {
         const rebuilt = await ensureOutput(document, path)
         const file = await document.pdf()
         let anchor: { file: string; line: number } | undefined
+        let syncTeX: string | undefined
         if (request.source && path) {
           anchor = { file: resolve(root, path), line: request.source.line }
           const { stdout } = await exec(
@@ -314,10 +319,11 @@ export async function paperPdfRoutes(directory: string, mainTex?: string) {
             throw new PaperPdfError(
               'This source line has no PDF location. Check that the selected main TeX file includes it.',
             )
+          syncTeX = stdout
         }
         switch (request.viewer) {
           case 'okular':
-            await desktop.open(main, file, anchor, rebuilt)
+            await desktop.open(main, file, anchor, rebuilt, syncTeX)
             break
           case 'sioyek':
             await openViewer(
