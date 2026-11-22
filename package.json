@@ -4,7 +4,8 @@
   "license": "MPL-2.0",
   "repository": "github:oxidecomputer/skepsis",
   "bin": {
-    "skepsis": "dist/cli.js"
+    "skepsis": "dist/cli.js",
+    "skepsis-jump": "bin/skepsis-jump.mjs"
   },
   "files": [
     "dist"
@@ -17,6 +18,7 @@
     "dev": "vite",
     "build": "rm -rf dist && vite build && tsdown",
     "prepack": "npm run build",
+    "install:okular-jump": "mkdir -p ~/.local/bin && install -m 755 bin/skepsis-jump.mjs ~/.local/bin/skepsis-jump",
     "fmt": "oxfmt --write .",
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint",

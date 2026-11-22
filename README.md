@@ -135,6 +135,53 @@ skepsis -f v1.2.0 -t v1.3.0      # compare two tags
 skepsis --git                    # force git in a jj-colocated repo
 ```
 
+## LaTeX paper review
+
+Run from a Git manuscript repository:
+
+```sh
+skepsis --paper
+```
+
+Select the **Fixed base** and **Compare with** revisions in the browser.
+The base defaults to `HEAD` and the target to **Working copy**. Use
+`--from` and `--to` to preselect a commit, branch, or tag. The same Git review
+shows every file type. Within each `.tex` diff line, sentence-ending punctuation
+can start a new display line. The original source line numbers and Git changes
+are preserved. Choose **Working copy** to add inline comments to your files.
+
+### External PDF readers
+
+Build the working copy with SyncTeX and keep both outputs beside the main file.
+For a project with its main file at the root:
+
+```sh
+latexmk -pdf -synctex=1 main.tex
+skepsis --paper
+```
+
+Use **PDF** in the toolbar to select the **Main TeX file** and choose Okular,
+Sioyek, or Zathura. **Open PDF** opens the compiled file on the desktop running
+Skepsis. The optional `--main-tex main.tex` flag preselects the main file.
+
+Click a working-copy TeX line number in the diff to jump to the external PDF.
+Skepsis selects the main TeX file automatically when exactly one has a PDF and
+SyncTeX file beside it. Opening a PDF or jumping from TeX rebuilds missing or
+older output with `latexmk` and pdfLaTeX. A failed build keeps the previous PDF.
+
+#### Use a saved Okular editor command
+
+From a Skepsis checkout, run `npm run install:okular-jump` to install the
+callback in `~/.local/bin/skepsis-jump`. In Okular, open **Settings →
+Configure Okular → Editor**, select **Custom Text Editor**, and save
+`skepsis-jump %f %l`. If Okular does not get your shell's PATH, use the
+absolute path to the installed command. Use **Tools → Browse** for Shift-click.
+
+Open the PDF from your running `skepsis --paper` review. Shift-click the PDF
+text and return to the browser to see the highlighted working-copy line in
+the diff, including unchanged lines. The same Okular setting works across
+projects and review restarts. This setup has been verified on Linux.
+
 ## How it works
 
 The CLI starts a local HTTP server that shells out to `jj diff`

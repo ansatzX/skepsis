@@ -50,6 +50,11 @@ const program = new Command()
     '--interdiff',
     'Show how the change in --to differs from the change in --from (jj only)',
   )
+  .option('--paper', 'review a Git paper project with LaTeX line reflow and PDF jumps')
+  .option(
+    '--main-tex <path>',
+    'preview the compiled PDF for this project-relative TeX root',
+  )
   .option('--git', 'force git mode (skip jj detection)')
   .option('--dev', 'run with Vite dev server for development')
   .option('--host <address>', 'address to bind the HTTP server to', 'localhost')
@@ -125,7 +130,16 @@ function detectVcs(): 'jj' | 'git' {
   }
 }
 
-const vcs = opts.git ? 'git' : detectVcs()
+if (opts.mainTex && !opts.paper) fail('--main-tex needs --paper')
+if (opts.paper && (opts.revisions || opts.interdiff || files.length)) {
+  fail(
+    '--paper accepts --from <base> and --to <version>; omit --revisions, --interdiff and path filters',
+  )
+}
+const paper = opts.paper
+  ? { base: opts.from ?? 'HEAD', target: opts.to, mainTex: opts.mainTex }
+  : undefined
+const vcs = opts.git || paper ? 'git' : detectVcs()
 
 if (opts.interdiff) {
   if (vcs !== 'jj') fail('--interdiff needs jj')
@@ -230,7 +244,7 @@ function buildDiffSource(): DiffArgs {
     let toWorkingCopy: boolean
     let endpoints: DiffEndpoints
     let displayArgs: string[] | undefined
-    if (opts.from || opts.to) {
+    if (opts.from || opts.to || paper) {
       if (opts.to) {
         // Explicit --to: commit-to-commit diff, no working copy
         args = [opts.from ?? 'HEAD', opts.to]
@@ -238,9 +252,10 @@ function buildDiffSource(): DiffArgs {
         endpoints = { left: opts.from ?? 'HEAD', right: { rev: opts.to } }
       } else {
         // --from only: git diff <from> includes working tree
-        args = [opts.from!]
+        const from = opts.from ?? 'HEAD'
+        args = [from]
         toWorkingCopy = true
-        endpoints = { left: opts.from!, right: 'workingCopy' }
+        endpoints = { left: from, right: 'workingCopy' }
       }
     } else if (!opts.revisions) {
       // Default: the git translation of the jj default — diff the working
@@ -279,6 +294,17 @@ function buildDiffSource(): DiffArgs {
 
 const diffSource = buildDiffSource()
 
+if (paper) {
+  try {
+    const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    process.chdir(root.replace(/\r?\n$/, ''))
+  } catch {
+    fail('--paper needs a Git working tree')
+  }
+}
 const cwd = process.cwd()
 const children: ReturnType<typeof spawn>[] = []
 
@@ -316,7 +342,11 @@ const checkoutRoot = opts.dev ? requireCheckoutRoot() : undefined
 // In development Vite owns the browser-facing port and proxies API requests
 // to this server, so leave the API on an ephemeral port. In the packaged app
 // the API server also serves the UI and can bind the requested port directly.
-const { port: apiPort, token } = await startServer({
+const {
+  port: apiPort,
+  token,
+  close,
+} = await startServer({
   diffSource,
   cwd,
   hostname,
@@ -324,10 +354,13 @@ const { port: apiPort, token } = await startServer({
   poll: opts.poll,
   send,
   tabSize: opts.tabSize,
+  paper,
 }).catch((err: Error) => {
   console.error(err.message)
   return cleanup(1)
 })
+
+process.once('exit', close)
 
 function urlOpenCommand(url: string): { cmd: string; args: string[] } {
   // "$1" rather than splicing the URL into the command, so the shell never
@@ -352,7 +385,7 @@ if (opts.dev) {
   const viteArgs = ['vite', '--host', hostname]
   if (opts.port) viteArgs.push('--port', String(opts.port), '--strictPort')
   // Vite resolves a string --open against its own URL, fragment included.
-  if (shouldAutoOpen) viteArgs.push('--open', `/#token=${token}`)
+  if (shouldAutoOpen) viteArgs.push('--open', `/${paper ? '?paper=1' : ''}#token=${token}`)
   const vite = spawn('npx', viteArgs, {
     cwd: checkoutRoot,
     stdio: 'inherit',
@@ -360,7 +393,7 @@ if (opts.dev) {
   })
   children.push(vite)
 } else if (shouldAutoOpen) {
-  const url = `http://localhost:${apiPort}/#token=${token}`
+  const url = `http://localhost:${apiPort}/${paper ? '?paper=1' : ''}#token=${token}`
   const { cmd, args } = urlOpenCommand(url)
   // A custom command's stderr shows, since a typo there is the user's to fix.
   const opener = spawn(cmd, args, {

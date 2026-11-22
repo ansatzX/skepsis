@@ -12,10 +12,13 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import { zValidator } from '@hono/zod-validator'
 import { basename, join, relative } from 'node:path'
 import { readFile } from 'node:fs/promises'
+import { PAPER_BASE_HEADER, PAPER_TARGET_HEADER } from '../shared/paper.ts'
 import type { DiffArgs } from '../shared/types.ts'
 import { getDiff, patchHash } from './diff.ts'
 import { displayCommand } from './displayCommand.ts'
 import { getFileContents } from './fileContents.ts'
+import { paperRoutes } from './paper.ts'
+import type { PaperOptions } from './paper.ts'
 import { getGeneratedFiles } from './generated.ts'
 import { loadViewed, markViewed, unmarkViewed, unmarkViewedAll } from './viewed.ts'
 import { insertComment, removeComment } from './comment.ts'
@@ -58,6 +61,7 @@ export async function startServer(opts: {
   sendTimeoutMs?: number
   /** Tab width in columns (default: DEFAULT_TAB_SIZE) */
   tabSize?: number
+  paper?: PaperOptions
 }): Promise<{ port: number; token: string; close: () => void }> {
   const { diffSource, port = 0, hostname = 'localhost', cwd, poll = true, send } = opts
   const { tabSize = DEFAULT_TAB_SIZE } = opts
@@ -83,13 +87,29 @@ export async function startServer(opts: {
     )
   })
 
+  const paper = opts.paper && (await paperRoutes(cwd, opts.paper))
+  if (paper) app.route('/api/paper', paper.app)
+
+  function reviewDiff(base: string | undefined, target: string | undefined) {
+    if (!base || !paper) return diffSource
+    const source = paper.diffFor(
+      decodeURIComponent(base),
+      target && decodeURIComponent(target),
+    )
+    if (!source) throw new Error('Unknown paper review version.')
+    return source
+  }
+
   // An interdiff that ends at the working copy still can't take comments: a
   // changed description shows as a file named JJ-COMMIT-DESCRIPTION, which a
   // comment would create on disk.
-  const commentsEnabled = diffSource.toWorkingCopy && !diffSource.interdiff
-
   app.get('/api/diff', async (c) => {
-    const { patch, fileHashes } = await getDiff(diffSource)
+    const source = reviewDiff(
+      c.req.header(PAPER_BASE_HEADER),
+      c.req.header(PAPER_TARGET_HEADER),
+    )
+    const commentsEnabled = source.toWorkingCopy && !source.interdiff
+    const { patch, fileHashes } = await getDiff(source)
     const files = Object.keys(fileHashes)
     const [viewed, generated, commentSyntaxes] = await Promise.all([
       loadViewed(cwd, fileHashes),
@@ -98,12 +118,12 @@ export async function startServer(opts: {
     ])
     return c.json({
       patch,
-      revset: displayCommand(diffSource),
+      revset: displayCommand(source),
       repo: basename(cwd),
-      vcs: diffSource.vcs,
-      interdiff: !!diffSource.interdiff,
+      vcs: source.vcs,
+      interdiff: !!source.interdiff,
       commentsEnabled,
-      expandable: diffSource.endpoints !== null,
+      expandable: source.endpoints !== null,
       fileHashes,
       patchHash: patchHash(patch),
       poll,
@@ -121,24 +141,36 @@ export async function startServer(opts: {
   // doesn't share: it follows the page's own edits (a comment), and a poll
   // that started before the edit would hand back the old patch. For the same
   // reason, an edit stops later polls from sharing a diff already running.
-  let hashInFlight: Promise<string> | null = null
+  const hashInFlight = new Map<string, Promise<string>>()
   app.get('/api/diff-hash', async (c) => {
     if (!poll)
       return c.json({ error: 'polling is off (--no-poll)' } satisfies ErrorResponse, 404)
-    if (!hashInFlight) {
-      const run = getDiff(diffSource)
+    const source = reviewDiff(
+      c.req.header(PAPER_BASE_HEADER),
+      c.req.header(PAPER_TARGET_HEADER),
+    )
+    const key = JSON.stringify(source.args)
+    let pending = hashInFlight.get(key)
+    if (!pending) {
+      const run = getDiff(source)
         .then(({ patch }) => patchHash(patch))
         .finally(() => {
-          if (hashInFlight === run) hashInFlight = null
+          if (hashInFlight.get(key) === run) hashInFlight.delete(key)
         })
-      hashInFlight = run
+      hashInFlight.set(key, run)
+      pending = run
     }
-    return c.json({ hash: await hashInFlight } satisfies DiffHashResponse)
+    return c.json({ hash: await pending } satisfies DiffHashResponse)
   })
 
   app.get('/api/file-contents', zValidator('query', fileContentsQuerySchema), async (c) => {
     const { path, oldPath } = c.req.valid('query')
-    const contents = await getFileContents(diffSource, cwd, path, oldPath)
+    const contents = await getFileContents(
+      reviewDiff(c.req.header(PAPER_BASE_HEADER), c.req.header(PAPER_TARGET_HEADER)),
+      cwd,
+      path,
+      oldPath,
+    )
     return c.json(contents satisfies FileContentsResponse)
   })
 
@@ -163,7 +195,7 @@ export async function startServer(opts: {
   app.post('/api/comment', zValidator('json', commentRequestSchema), async (c) => {
     const { file, afterLine, lineText, text, lineCount, quote } = c.req.valid('json')
     await insertComment(cwd, file, afterLine, lineText, text, lineCount, quote)
-    hashInFlight = null
+    hashInFlight.clear()
     return c.json({ ok: true } satisfies OkResponse)
   })
 
@@ -190,7 +222,11 @@ export async function startServer(opts: {
         // The blob comes from the page with the lines and excerpt, so all
         // three describe the version on screen even if the file has changed
         // since. Nothing here awaits, so sends join the queue as they arrive.
-        const payload = buildPayload(diffSource, cwd, c.req.valid('json'))
+        const payload = buildPayload(
+          reviewDiff(c.req.header(PAPER_BASE_HEADER), c.req.header(PAPER_TARGET_HEADER)),
+          cwd,
+          c.req.valid('json'),
+        )
         const env = { SKEPSIS_URL: serverUrl, SKEPSIS_ROOT: cwd }
         const run = () =>
           runSend(send, payload, { cwd, env, timeoutMs: opts.sendTimeoutMs })
@@ -206,7 +242,7 @@ export async function startServer(opts: {
   app.delete('/api/comment', zValidator('json', commentDeleteSchema), async (c) => {
     const { file, line } = c.req.valid('json')
     await removeComment(cwd, file, line)
-    hashInFlight = null
+    hashInFlight.clear()
     return c.json({ ok: true } satisfies OkResponse)
   })
 
@@ -251,9 +287,16 @@ export async function startServer(opts: {
       const assignedPort = typeof info === 'string' ? port : info.port
       serverUrl = `http://${hostname}:${assignedPort}`
       console.info(
-        `skepsis on ${serverUrl}/#token=${token} (${displayCommand(diffSource)})`,
+        `skepsis on ${serverUrl}/${opts.paper ? '?paper=1' : ''}#token=${token} (${displayCommand(diffSource)})`,
       )
-      resolve({ port: assignedPort, token, close: () => server.close() })
+      resolve({
+        port: assignedPort,
+        token,
+        close: () => {
+          paper?.close()
+          server.close()
+        },
+      })
     })
     server.on('error', reject)
   })

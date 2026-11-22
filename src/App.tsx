@@ -6,6 +6,9 @@
  * Copyright Oxide Computer Company
  */
 
+import { PAPER_BASE_HEADER, PAPER_TARGET_HEADER } from '../shared/paper.ts'
+import type { PaperFileContents, PdfSource } from '../shared/paper.ts'
+import { formatTexRows } from './paper/displayLines.ts'
 import {
   QueryClient,
   QueryClientProvider,
@@ -176,12 +179,70 @@ class ApiError extends Error {
 /** The server turned the request away for lacking the run's token. */
 const isTokenError = (error: unknown) => error instanceof ApiError && error.status === 401
 
-async function apiFetch<T = unknown>(
+type ApiOptions = { method: string; body?: unknown }
+type ReviewRevisions = { base: string; target: string }
+type PaperSourceNavigation = {
+  addedFiles: string[]
+  open?: (path: string) => void
+  forward?: (source: PdfSource) => void
+  destination?: PdfSource
+  context?: { path: string; contents: PaperFileContents }
+  fallback: (source: PdfSource) => void
+}
+
+function pdfContextDiff(path: string, { left, right }: PaperFileContents) {
+  const diff = normalizeFileType(
+    parseDiffFromFile(
+      { name: path, contents: left ?? '' },
+      { name: path, contents: right ?? '' },
+      { context: Number.MAX_SAFE_INTEGER },
+    ),
+  )
+  const lines = diff.additionLines.length
+  if (diff.hunks.length || !lines) return diff
+  // A line can be in SyncTeX even when Git has no changes for its file.
+  // Expose the real before and after text as one all-context native hunk.
+  const noNewline = !right?.endsWith('\n')
+  return {
+    ...diff,
+    splitLineCount: lines,
+    unifiedLineCount: lines,
+    hunks: [
+      {
+        collapsedBefore: 0,
+        additionStart: 1,
+        additionCount: lines,
+        additionLines: 0,
+        additionLineIndex: 0,
+        deletionStart: 1,
+        deletionCount: lines,
+        deletionLines: 0,
+        deletionLineIndex: 0,
+        hunkContent: [
+          { type: 'context', lines, additionLineIndex: 0, deletionLineIndex: 0 },
+        ],
+        splitLineStart: 0,
+        splitLineCount: lines,
+        unifiedLineStart: 0,
+        unifiedLineCount: lines,
+        noEOFCRAdditions: noNewline,
+        noEOFCRDeletions: noNewline,
+      },
+    ],
+  } satisfies FileDiffMetadata
+}
+
+export async function apiFetch<T = unknown>(
   url: string,
-  opts: { method: string; body?: unknown } = { method: 'GET' },
+  opts: ApiOptions = { method: 'GET' },
+  review?: ReviewRevisions,
 ): Promise<T> {
   const headers: Record<string, string> = {}
   if (token) headers[TOKEN_HEADER] = token
+  const reviewBase =
+    review?.base ?? new URLSearchParams(window.location.search).get('reviewBase')
+  if (reviewBase) headers[PAPER_BASE_HEADER] = encodeURIComponent(reviewBase)
+  if (review) headers[PAPER_TARGET_HEADER] = encodeURIComponent(review.target)
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json'
   const res = await fetch(url, {
     method: opts.method,
@@ -620,6 +681,25 @@ const isNewSideLine = (row: HTMLElement) =>
   row.hasAttribute('data-column-number') &&
   row.getAttribute('data-line-type') !== 'change-deletion'
 
+function linkPdfGutters(root: ShadowRoot, enabled: boolean) {
+  for (const label of root.querySelectorAll<HTMLElement>('[data-line-number-content]')) {
+    const line = label.parentElement
+    const link = enabled && line && isNewSideLine(line) && !line.closest('[data-deletions]')
+    if (link ? label.tagName === 'BUTTON' : label.tagName !== 'BUTTON') continue
+    const replacement = document.createElement(link ? 'button' : 'span')
+    replacement.setAttribute('data-line-number-content', '')
+    replacement.textContent = label.textContent
+    if (link) {
+      const number = line.getAttribute('data-column-number')!
+      replacement.setAttribute('type', 'button')
+      replacement.setAttribute('data-paper-pdf-line', number)
+      replacement.setAttribute('aria-label', `Find source line ${number} in PDF`)
+      replacement.setAttribute('title', 'Find this line in PDF')
+    }
+    label.replaceWith(replacement)
+  }
+}
+
 /** Run the rail down a column's gutter rows: through the lines a comment is
  *  on, the comment itself, and its annotation row. It bridges rows with no
  *  new-side line (deletions, spacers, collapsed-line separators) between
@@ -1049,6 +1129,7 @@ function FileHeader({
   onToggleCollapse,
   onToggleViewed,
   onToggleExpand,
+  onOpenSource,
 }: {
   fileDiff: FileDiffMetadata
   isViewed: boolean
@@ -1063,6 +1144,7 @@ function FileHeader({
   onToggleCollapse: () => void
   onToggleViewed: () => void
   onToggleExpand: () => void
+  onOpenSource?: () => void
 }) {
   const { additions, deletions } = getFileStats(fileDiff)
   const [copied, setCopied] = useState(false)
@@ -1120,6 +1202,18 @@ function FileHeader({
         </button>
       </Tip>
       {generated && <span className="generated-label">Generated</span>}
+      {onOpenSource && (
+        <button
+          type="button"
+          className="viewed-button"
+          onClick={(event) => {
+            event.stopPropagation()
+            onOpenSource()
+          }}
+        >
+          PDF source
+        </button>
+      )}
       {showExpand && (
         <Tip
           text={
@@ -1657,7 +1751,29 @@ function topFileName(
   return name
 }
 
-function DiffView() {
+function DiffView({
+  fetchJson,
+  paper,
+}: {
+  fetchJson: typeof apiFetch
+  paper?: PaperSourceNavigation
+}) {
+  const paperMode = paper !== undefined
+  const openPaperSource = paper?.open
+  const forwardToPdf = paper?.forward
+  const canJumpToPdf = forwardToPdf !== undefined
+  const pdfDestination = paper?.destination
+  const openFallbackSource = paper?.fallback
+  const additionalFiles = paper?.addedFiles
+  const contextPath = paper?.context?.path
+  const contextContents = paper?.context?.contents
+  const contextFile = useMemo(
+    () =>
+      contextPath && contextContents
+        ? pdfContextDiff(contextPath, contextContents)
+        : undefined,
+    [contextPath, contextContents],
+  )
   const isWide = useMediaQuery(wideQuery)
   const isNarrow = useMediaQuery(narrowQuery)
   const [splitMode, setSplitMode] = useState<SplitMode>('responsive')
@@ -1717,7 +1833,7 @@ function DiffView() {
   const { data, error, errorUpdatedAt, isLoading } = useQuery({
     queryKey: ['diff'],
     queryFn: async () => {
-      const diff = await apiFetch<DiffResponse>('/api/diff')
+      const diff = await fetchJson<DiffResponse>('/api/diff')
       // The last poll's hash can predate the page's own writes (a comment),
       // which would raise the banner until the next poll, and a poll still in
       // flight can land after this with the old hash. This diff is at least
@@ -1740,7 +1856,7 @@ function DiffView() {
   // Refresh.
   const { data: hashData } = useQuery({
     queryKey: ['diff-hash'],
-    queryFn: () => apiFetch<DiffHashResponse>('/api/diff-hash'),
+    queryFn: () => fetchJson<DiffHashResponse>('/api/diff-hash'),
     enabled: data?.poll === true,
     refetchInterval: POLL_MS,
   })
@@ -1750,7 +1866,7 @@ function DiffView() {
   // without replacing the one on screen.
   const { data: nextDiff } = useQuery({
     queryKey: ['diff-preview', hashData?.hash],
-    queryFn: () => apiFetch<DiffResponse>('/api/diff'),
+    queryFn: () => fetchJson<DiffResponse>('/api/diff'),
     enabled: diffChanged,
     // Each new hash is a new key. Keep listing the last preview's files
     // until the new one loads, rather than emptying the list in between.
@@ -1800,14 +1916,14 @@ function DiffView() {
   // moment cross-instance staleness is observable.
   const { data: themeData } = useQuery({
     queryKey: ['theme'],
-    queryFn: () => apiFetch<ThemeResponse>('/api/theme'),
+    queryFn: () => fetchJson<ThemeResponse>('/api/theme'),
     initialData: { theme: initialTheme },
   })
   const theme = themeData.theme
 
   const themeMutation = useMutation({
     mutationFn: (next: ThemeMode) =>
-      apiFetch('/api/theme', { method: 'POST', body: { theme: next } }),
+      fetchJson('/api/theme', { method: 'POST', body: { theme: next } }),
     // Write the cache up front so the toggle doesn't fight a stale entry.
     onMutate: (next) => qc.setQueryData(['theme'], { theme: next } satisfies ThemeResponse),
   })
@@ -1846,7 +1962,7 @@ function DiffView() {
 
   const markMutation = useMutation({
     mutationFn: ({ file, hash, mark }: { file: string; hash: string; mark: boolean }) =>
-      apiFetch('/api/viewed', {
+      fetchJson('/api/viewed', {
         method: mark ? 'POST' : 'DELETE',
         body: { file, hash },
       }),
@@ -1855,13 +1971,13 @@ function DiffView() {
 
   const unviewAllMutation = useMutation({
     mutationFn: (files: { file: string; hash: string }[]) =>
-      apiFetch('/api/viewed-all', { method: 'DELETE', body: { files } }),
+      fetchJson('/api/viewed-all', { method: 'DELETE', body: { files } }),
     onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
   })
 
   const commentMutation = useMutation({
     mutationFn: (body: CommentRequest) =>
-      apiFetch('/api/comment', { method: 'POST', body }),
+      fetchJson('/api/comment', { method: 'POST', body }),
     onSuccess: () => setComposing(null),
     onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
   })
@@ -1871,7 +1987,7 @@ function DiffView() {
   const sendMutation = useMutation({
     // `quote` is for the sent comment to show
     mutationFn: ({ quote: _, ...body }: SendRequest & { quote: string | null }) =>
-      apiFetch('/api/send', { method: 'POST', body }),
+      fetchJson('/api/send', { method: 'POST', body }),
     onSuccess: (_, { file, side, lines, quote, text }) => {
       setComposing(null)
       // The page only sends from a line, so these are always set
@@ -1885,7 +2001,7 @@ function DiffView() {
 
   const resolveMutation = useMutation({
     mutationFn: ({ file, line }: { file: string; line: number }) =>
-      apiFetch('/api/comment', {
+      fetchJson('/api/comment', {
         method: 'DELETE',
         body: { file, line },
       }),
@@ -1907,9 +2023,8 @@ function DiffView() {
   // yields the same reuse.
   const parsedFilesRef = useRef(new Map<string, FileDiffMetadata>())
   const { patchFiles, treePaths, treeStatus } = useMemo(() => {
-    if (!patch) return { patchFiles: [], treePaths: [], treeStatus: [] }
     const parsed = mergeDuplicateFiles(
-      parsePatchFiles(patch).flatMap((p) => p.files),
+      patch ? parsePatchFiles(patch).flatMap((p) => p.files) : [],
     ).toSorted((a, b) => compareTreeOrder(a.name, b.name))
     const status: GitStatusEntry[] = parsed.flatMap((f) => {
       const s = TREE_STATUS[f.type]
@@ -1921,12 +2036,25 @@ function DiffView() {
       return prev && sameFileVersion(prev, file) ? prev : file
     })
     parsedFilesRef.current = new Map(files.map((f) => [f.name, f]))
+    const otherPaths =
+      additionalFiles?.filter((path) => !parsedFilesRef.current.has(path)) ?? []
+    const contextOnlyPath =
+      contextPath &&
+      !parsedFilesRef.current.has(contextPath) &&
+      !otherPaths.includes(contextPath)
+        ? [contextPath]
+        : []
     return {
       patchFiles: files,
-      treePaths: parsed.map((f) => f.name),
-      treeStatus: status,
+      treePaths: [...parsed.map((f) => f.name), ...otherPaths, ...contextOnlyPath].toSorted(
+        compareTreeOrder,
+      ),
+      treeStatus: [
+        ...status,
+        ...otherPaths.map((path) => ({ path, status: 'added' as const })),
+      ],
     }
-  }, [patch])
+  }, [patch, additionalFiles, contextPath])
   const nextPatch = nextDiff?.patch
   const changes = useMemo(() => {
     if (nextPatch === undefined) return null
@@ -1956,11 +2084,11 @@ function DiffView() {
       if (file.prevName) params.set('oldPath', file.prevName)
       return qc.fetchQuery({
         queryKey: ['file-contents', file.name, data?.fileHashes[file.name]] as const,
-        queryFn: () => apiFetch<FileContentsResponse>(`/api/file-contents?${params}`),
+        queryFn: () => fetchJson<FileContentsResponse>(`/api/file-contents?${params}`),
         staleTime: Infinity,
       })
     },
-    [qc, data],
+    [qc, data, fetchJson],
   )
   // Held in a ref so the CodeView options object (which re-renders every item
   // when its identity changes) doesn't depend on the current file hashes.
@@ -1978,7 +2106,7 @@ function DiffView() {
       if (f.prevName) params.set('oldPath', f.prevName)
       return {
         queryKey: ['file-contents', f.name, hash] as const,
-        queryFn: () => apiFetch<FileContentsResponse>(`/api/file-contents?${params}`),
+        queryFn: () => fetchJson<FileContentsResponse>(`/api/file-contents?${params}`),
         enabled: expandable && f.hunks.length > 0 && (expandedFiles[f.name] ?? false),
         staleTime: Infinity,
       }
@@ -2007,7 +2135,7 @@ function DiffView() {
     new Map<string, { old: string | null; new: string | null; diff: FileDiffMetadata }>(),
   )
   const files = useMemo(() => {
-    return patchFiles.map((f) => {
+    const displayed = patchFiles.map((f) => {
       if (!(expandedFiles[f.name] ?? false)) return f
       const c = contentsByFile.get(f.name)
       const cached = parsedCacheRef.current.get(f.name)
@@ -2039,7 +2167,12 @@ function DiffView() {
       })
       return diff
     })
-  }, [patchFiles, contentsByFile, loadingContents, expandedFiles])
+    if (contextFile && !displayed.some((file) => file.name === contextFile.name)) {
+      displayed.push(contextFile)
+      return displayed.toSorted((a, b) => compareTreeOrder(a.name, b.name))
+    }
+    return displayed
+  }, [patchFiles, contentsByFile, loadingContents, expandedFiles, contextFile])
 
   // Navigable lines per file for the j/k cursor: addition-side line numbers
   // (context + additions; deletions are skipped), derived from hunk metadata
@@ -2234,6 +2367,7 @@ function DiffView() {
     if (!data) return []
     return files.map((fileDiff, i) => {
       const name = fileDiff.name
+      const prev = versionsRef.current.get(name)
       // The worker pool caches highlighted output by cacheKey, which the
       // library defaults to the file name. A refetched diff with new content
       // under the same name (e.g. right after a comment is written or
@@ -2246,7 +2380,10 @@ function DiffView() {
       // The inputs never change for a given object anyway, since a new patch
       // or hash means a new parse.
       const hash = data.fileHashes[name] ?? ''
-      fileDiff.cacheKey ??= `${name}|${hash}|${fileDiff === patchFiles[i] ? 'patch' : 'full'}`
+      fileDiff.cacheKey ??=
+        fileDiff === contextFile
+          ? `${name}|pdf-context|${(prev?.version ?? 0) + 1}`
+          : `${name}|${hash}|${fileDiff === patchFiles[i] ? 'patch' : 'full'}`
       const syntax = data.commentSyntaxes[name]
       const annotations = commentsEnabled
         ? detectReviewComments(
@@ -2289,7 +2426,6 @@ function DiffView() {
       const isCollapsed = collapsed[name] ?? false
       const composingLine = composingHere ? `${composing.side}${composing.line}` : -1
       const key = `${data.fileHashes[name] ?? ''}|${composingLine}|${sentHere.join(',')}|${isCollapsed ? 1 : 0}`
-      const prev = versionsRef.current.get(name)
       const changed = !prev || prev.key !== key || prev.fileDiff !== fileDiff
       const version = changed ? (prev?.version ?? 0) + 1 : prev.version
       if (changed) versionsRef.current.set(name, { key, fileDiff, version })
@@ -2302,7 +2438,7 @@ function DiffView() {
         version,
       }
     })
-  }, [files, patchFiles, data, composing, sent, collapsed, commentsEnabled])
+  }, [files, patchFiles, data, composing, sent, collapsed, commentsEnabled, contextFile])
   itemsRef.current = items
 
   // The header highlight falls back to the first file before any focus exists
@@ -2375,12 +2511,15 @@ function DiffView() {
   // drawer would cover the file, so it closes.
   const onTreeSelect = useCallback(
     (path: string) => {
-      if (!itemsRef.current.some((it) => it.id === path)) return
-      setFocused(path)
-      scrollItemToStart(path)
+      if (itemsRef.current.some((it) => it.id === path)) {
+        setFocused(path)
+        scrollItemToStart(path)
+      } else {
+        openPaperSource?.(path)
+      }
       setDrawerOpen(false)
     },
-    [setFocused, scrollItemToStart],
+    [setFocused, scrollItemToStart, openPaperSource],
   )
 
   useLayoutEffect(() => {
@@ -2395,6 +2534,59 @@ function DiffView() {
       behavior: 'instant',
     })
   }, [items, markProgrammaticScroll])
+
+  const locatedPdfSource = useRef<PdfSource>(undefined)
+  useLayoutEffect(() => {
+    if (!data || !pdfDestination || locatedPdfSource.current === pdfDestination) return
+    const frame = requestAnimationFrame(() => {
+      const { path, line } = pdfDestination
+      const item = items.find((candidate) => candidate.id === path)
+      const handle = codeViewRef.current
+      if (item && handle && fileLines.get(path)?.includes(line)) {
+        if (item.collapsed) {
+          setCollapsed((previous) => ({ ...previous, [path]: false }))
+          return
+        }
+        locatedPdfSource.current = pdfDestination
+        setFocused(path)
+        setCursor({ file: path, line })
+        anchorTargetRef.current = null
+        markProgrammaticScroll()
+        handle.scrollTo({
+          type: 'line',
+          id: path,
+          lineNumber: line,
+          side: 'additions',
+          align: 'center',
+          behavior: 'instant',
+        })
+        return
+      }
+      if (item?.fileDiff.hunks.length && expandable) {
+        if (!expandedFiles[path]) {
+          setExpandedFiles((previous) => ({ ...previous, [path]: true }))
+          return
+        }
+        const query = contentQueries[patchFiles.findIndex((file) => file.name === path)]
+        if (query?.isPending || query?.isFetching) return
+      }
+      locatedPdfSource.current = pdfDestination
+      openFallbackSource?.(pdfDestination)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [
+    data,
+    pdfDestination,
+    items,
+    fileLines,
+    expandable,
+    expandedFiles,
+    contentQueries,
+    patchFiles,
+    openFallbackSource,
+    setFocused,
+    markProgrammaticScroll,
+  ])
 
   // The cursor is drawn as each item's editor active line rather than as a
   // line selection, because the library pins the gutter "+" to a selection and
@@ -2438,6 +2630,11 @@ function DiffView() {
           showExpand={showExpand}
           expandDisabledReason={expandDisabledReason}
           expanded={expandedFiles[name] ?? false}
+          onOpenSource={
+            openPaperSource && /\.tex$/i.test(name) && item.fileDiff.type !== 'deleted'
+              ? () => openPaperSource(name)
+              : undefined
+          }
           onToggleCollapse={() => {
             anchorIfTopFile(name)
             setCollapsed((prev) => ({ ...prev, [name]: !isCollapsed }))
@@ -2471,6 +2668,7 @@ function DiffView() {
       markMutation,
       anchorIfTopFile,
       effectiveFocused,
+      openPaperSource,
     ],
   )
 
@@ -2784,7 +2982,28 @@ function DiffView() {
             }
           }
         : undefined,
-      unsafeCSS: send ? DIFF_CSS : DIFF_CSS + ADDITIONS_ONLY_CSS,
+      unsafeCSS:
+        (send ? DIFF_CSS : DIFF_CSS + ADDITIONS_ONLY_CSS) +
+        (canJumpToPdf
+          ? `
+        [data-column-number]:has(> [data-paper-pdf-line]) {
+          padding-inline-end: 1lh;
+        }
+        [data-paper-pdf-line] {
+          appearance: none;
+          padding: 0;
+          border: 0;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          cursor: pointer;
+        }
+        [data-paper-pdf-line]:is(:hover, :focus-visible) {
+          text-decoration: underline;
+          text-underline-offset: 0.18em;
+        }
+      `
+          : ''),
       onGutterUtilityClick: (range, context) => gutterClickRef.current(range, context.item),
       // Re-tag review-comment lines whenever an item (re)renders. Runs per item
       // and re-derives tags from scratch, so pooled/recycled elements never keep
@@ -2811,10 +3030,14 @@ function DiffView() {
         )
         const { blocks, targets } = reviewRanges(context.item.annotations)
         tagReviewLines(node, blocks, targets)
+        if (paperMode && node.shadowRoot) {
+          formatTexRows(node.shadowRoot, /\.tex$/i.test(id))
+          linkPdfGutters(node.shadowRoot, canJumpToPdf && /\.tex$/i.test(id))
+        }
         if (composingRef.current?.file === id) markQuoteRef.current()
       },
     }),
-    [theme, diffStyle, commentsEnabled, send, expandable],
+    [theme, diffStyle, commentsEnabled, send, expandable, paperMode, canJumpToPdf],
   )
 
   // Keyboard shortcuts. File navigation (n/p) and the focused-file actions
@@ -3137,7 +3360,7 @@ function DiffView() {
     return <pre style={{ color: 'red', padding: 20 }}>{String(error)}</pre>
   if (isLoading || !data) return <div className="empty-diff">Loading...</div>
   if (data.error) return <pre style={{ color: 'red', padding: 20 }}>{data.error}</pre>
-  if (!patch)
+  if (!patch && treePaths.length === 0)
     return (
       <>
         {diffChanged && (
@@ -3213,6 +3436,21 @@ function DiffView() {
           // The diff library reads its tab width from this property, which
           // inherits into each item's shadow root.
           style={{ '--diffs-tab-size': String(data.tabSize) } as CSSProperties}
+          onClickCapture={(event) => {
+            if (!forwardToPdf) return
+            const route = event.nativeEvent.composedPath()
+            const button = route.find(
+              (node) =>
+                node instanceof HTMLElement && node.hasAttribute('data-paper-pdf-line'),
+            ) as HTMLElement | undefined
+            if (!button) return
+            const root = button.getRootNode()
+            const path =
+              root instanceof ShadowRoot ? hostFiles.current.get(root.host) : undefined
+            if (!path) return
+            event.stopPropagation()
+            forwardToPdf({ path, line: Number(button.dataset.paperPdfLine) })
+          }}
           onPointerDownCapture={(e) => {
             if (e.button !== 0 || !(e.target instanceof Element)) return
             const diff = e.target.closest<HTMLElement>('.codeview-root')
@@ -3274,14 +3512,45 @@ const poolOptions = {
 }
 const highlighterOptions = { theme: DIFF_THEME, preferredHighlighter: HIGHLIGHTER }
 
-export function App() {
+export function App({
+  review,
+  paper,
+}: {
+  review?: ReviewRevisions
+  paper?: PaperSourceNavigation
+} = {}) {
+  const base = review?.base
+  const target = review?.target
+  const [client] = useState(() =>
+    review
+      ? new QueryClient({ defaultOptions: queryClient.getDefaultOptions() })
+      : queryClient,
+  )
+  const fetchJson = useCallback(
+    <T,>(url: string, opts?: ApiOptions) =>
+      apiFetch<T>(
+        url,
+        opts,
+        base !== undefined && target !== undefined ? { base, target } : undefined,
+      ),
+    [base, target],
+  )
+  // A paper revision alias can change while the comparison and composer stay mounted.
+  const previousFetch = useRef(fetchJson)
+  useEffect(() => {
+    if (previousFetch.current === fetchJson) return
+    previousFetch.current = fetchJson
+    void client
+      .cancelQueries({ queryKey: ['diff'] })
+      .then(() => client.invalidateQueries({ queryKey: ['diff'] }))
+  }, [client, fetchJson])
   const app = (
     <Tooltip.Provider>
-      <DiffView />
+      <DiffView fetchJson={fetchJson} paper={paper} />
     </Tooltip.Provider>
   )
   return (
-    <QueryClientProvider client={queryClient}>
+    <QueryClientProvider client={client}>
       {HIGHLIGHTER === 'highlights' ? (
         app
       ) : (
